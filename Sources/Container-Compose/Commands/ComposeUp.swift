@@ -128,6 +128,10 @@ public struct ComposeUp: AsyncParsableCommand, @unchecked Sendable {
     private var containerIps: [String: String] = [:]
     private var serviceStartStates: [String: ServiceStartState] = [:]
     private var serviceHealth: [String: Bool] = [:]
+    /// Named volumes backed by a host directory so multiple containers (VMs)
+    /// can mount them concurrently. apple/container block volumes attach to a
+    /// single VM at a time; see `computeSharedVolumes`.
+    private var sharedVolumes: Set<String> = []
     /// Resolved container ID (i.e. the name on disk) per service.
     /// Equal to `service.container_name` when set, otherwise either
     /// `<serviceName>.<dnsDomain>` (DNS path) or `<projectName>-<serviceName>` (legacy).
@@ -210,8 +214,19 @@ public struct ComposeUp: AsyncParsableCommand, @unchecked Sendable {
         // This creates named volumes defined in the docker-compose.yml
         if let volumes = dockerCompose.volumes {
             print("\n--- Processing Volumes ---")
+            sharedVolumes = computeSharedVolumes(
+                serviceVolumes: project.services.map { ($0.serviceName, $0.service.volumes ?? []) },
+                environmentVariables: environmentVariables
+            )
+            if !sharedVolumes.isEmpty {
+                print("Shared (host-backed) volumes: \(sharedVolumes.sorted().joined(separator: ", "))")
+            }
             for (volumeName, volumeConfig) in volumes {
                 guard let volumeConfig else { continue }
+                if sharedVolumes.contains(volumeName) {
+                    print("Skipping block-volume creation for shared volume '\(volumeName)' (host-backed).")
+                    continue
+                }
                 try await createVolume(name: volumeName, config: volumeConfig)
             }
             print("--- Volumes Processed ---\n")
@@ -1146,8 +1161,8 @@ public struct ComposeUp: AsyncParsableCommand, @unchecked Sendable {
         // exclusive in Compose semantics — and `--entrypoint` must precede
         // the image. See the helper below for the full mapping.
         let argv = Self.entrypointAndCommandArgs(
-            entrypoint: service.entrypoint,
-            command: service.command
+            entrypoint: service.entrypoint?.map { resolveVariable($0, with: environmentVariables) },
+            command: service.command?.map { resolveVariable($0, with: environmentVariables) }
         )
         if let entrypointFlag = argv.entrypointFlag {
             runCommandArgs.append(contentsOf: ["--entrypoint", entrypointFlag])
@@ -1397,7 +1412,8 @@ public struct ComposeUp: AsyncParsableCommand, @unchecked Sendable {
             fileManager: fileManager,
             environmentVariables: environmentVariables,
             projectName: projectName,
-            volumeDefinitions: dockerCompose.volumes
+            volumeDefinitions: dockerCompose.volumes,
+            sharedVolumes: sharedVolumes
         )
     }
 }

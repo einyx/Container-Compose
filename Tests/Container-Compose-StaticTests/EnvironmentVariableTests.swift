@@ -143,3 +143,20 @@ struct EnvironmentVariableTests {
 }
 
 // Test helper function that mimics the actual implementation
+
+// MARK: - Nested defaults (regression: nested `${A:-${B:-v}}` broke the old regex)
+
+extension EnvironmentVariableTests {
+    @Test("Nested default resolves innermost fallback")
+    func nestedDefault() {
+        #expect(resolveVariable("ghcr.io/app:${A:-${B:-v0.5.24}}", with: [:]) == "ghcr.io/app:v0.5.24")
+        #expect(resolveVariable("ghcr.io/app:${A:-${B:-v0.5.24}}", with: ["B": "beta"]) == "ghcr.io/app:beta")
+        #expect(resolveVariable("ghcr.io/app:${A:-${B:-v0.5.24}}", with: ["A": "alpha"]) == "ghcr.io/app:alpha")
+    }
+
+    @Test("Command strings interpolate")
+    func commandInterpolation() {
+        #expect(resolveVariable("shared_buffers=${PG_SHARED_BUFFERS:-512MB}", with: [:]) == "shared_buffers=512MB")
+        #expect(resolveVariable("-c shared_buffers=${X:-1GB}", with: ["X": "2GB"]) == "-c shared_buffers=2GB")
+    }
+}

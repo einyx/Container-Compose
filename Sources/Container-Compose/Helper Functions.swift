@@ -103,36 +103,115 @@ public func loadEnvFile(path: String) -> [String: String] {
 ///   - envVars: A dictionary of environment variables to use for resolution.
 /// - Returns: The string with all recognized environment variables resolved.
 public func resolveVariable(_ value: String, with envVars: [String: String]) -> String {
-    var resolvedValue = value
-    // Regex to find ${VAR}, ${VAR:-default}, ${VAR:?error}
-    let regex = try! NSRegularExpression(pattern: #"\$\{([A-Za-z0-9_]+)(:?-(.*?))?(:\?(.*?))?\}"#, options: [])
-    
     // Combine process environment with loaded .env file variables, prioritizing process environment
     let combinedEnv = ProcessInfo.processInfo.environment.merging(envVars) { (current, _) in current }
-    
-    // Loop to resolve all occurrences of variables in the string
-    while let match = regex.firstMatch(in: resolvedValue, options: [], range: NSRange(resolvedValue.startIndex..<resolvedValue.endIndex, in: resolvedValue)) {
-        guard let varNameRange = Range(match.range(at: 1), in: resolvedValue) else { break }
-        let varName = String(resolvedValue[varNameRange])
-        
-        if let envValue = combinedEnv[varName] {
-            // Variable found in environment, replace with its value
-            resolvedValue.replaceSubrange(Range(match.range(at: 0), in: resolvedValue)!, with: envValue)
-        } else if let defaultValueRange = Range(match.range(at: 3), in: resolvedValue) {
-            // Variable not found, but default value is provided, replace with default
-            let defaultValue = String(resolvedValue[defaultValueRange])
-            resolvedValue.replaceSubrange(Range(match.range(at: 0), in: resolvedValue)!, with: defaultValue)
-        } else if match.range(at: 5).location != NSNotFound, let errorMessageRange = Range(match.range(at: 5), in: resolvedValue) {
-            // Variable not found, and error-on-missing syntax used, print error and exit
-            let errorMessage = String(resolvedValue[errorMessageRange])
-            fputs("Error: Missing required environment variable '\(varName)': \(errorMessage)\n", stderr)
-            Application.exit(withError: "Error: Missing required environment variable '\(varName)': \(errorMessage)\n")
+
+    // Scan for `${...}` expressions, handling nested `${}` inside default values
+    // (e.g. `${A:-${B:-fallback}}`), which regex-based matching cannot parse.
+    var result = ""
+    var i = value.startIndex
+    while i < value.endIndex {
+        if value[i] == "$", let (inner, afterExpr) = matchBracedExpression(value, at: i) {
+            result += resolveExpression(inner, envVars: combinedEnv)
+            i = afterExpr
         } else {
-            // Variable not found and no default/error specified, leave as is and break loop to avoid infinite loop
+            result.append(value[i])
+            i = value.index(after: i)
+        }
+    }
+    return result
+}
+
+/// If `s` contains a well-braced `${` expression starting at `start`, returns
+/// the inner expression text (without `${}`) and the index just past the
+/// closing `}`, honouring nested `${` sequences.
+private func matchBracedExpression(_ s: String, at start: String.Index) -> (String, String.Index)? {
+    var i = s.index(after: start)
+    guard i < s.endIndex, s[i] == "{" else { return nil }
+    var depth = 1
+    i = s.index(after: i)
+    let contentStart = i
+    while i < s.endIndex {
+        if s[i] == "$", s.index(after: i) < s.endIndex, s[s.index(after: i)] == "{" {
+            depth += 1
+            i = s.index(after: i)
+        } else if s[i] == "}" {
+            depth -= 1
+            if depth == 0 {
+                return (String(s[contentStart..<i]), s.index(after: i))
+            }
+        }
+        i = s.index(after: i)
+    }
+    return nil
+}
+
+/// Resolves the inner text of a `${...}` expression: `VAR`, `VAR:-default`,
+/// `VAR-default`, `VAR:?error`, `VAR?error`.
+private func resolveExpression(_ expr: String, envVars: [String: String]) -> String {
+    let twoCharOps = topLevelOperator(expr, operators: [":-", ":?"])
+    let oneCharOps = twoCharOps == nil ? topLevelOperator(expr, operators: ["-", "?"]) : nil
+    if let at = twoCharOps ?? oneCharOps {
+        let isColonPrefixed = expr[at] == ":"
+        let name = String(expr[expr.startIndex..<at])
+        var operandStart = expr.index(after: at)
+        if isColonPrefixed {
+            // Skip the `-`/`?` after the `:` (an `=` after `:` is not a
+            // supported operator and is treated as part of the operand).
+            if operandStart < expr.endIndex, "-?".contains(expr[operandStart]) {
+                operandStart = expr.index(after: operandStart)
+            }
+        }
+        let op = String(expr[at..<(isColonPrefixed ? operandStart : expr.index(after: at))])
+        let operand = String(expr[operandStart...])
+        let hasValue = envVars.keys.contains(name) && envVars[name]!.isEmpty == false
+        switch op {
+        case ":-":
+            if hasValue { return envVars[name]! }
+            return resolveVariable(operand, with: envVars)
+        case "-":
+            if let value = envVars[name] { return value }
+            return resolveVariable(operand, with: envVars)
+        case ":?", "?":
+            guard hasValue || (op == "?" && envVars[name] != nil) else {
+                fputs("Error: Missing required environment variable '\(name)': \(operand)\n", stderr)
+                Application.exit(withError: "Error: Missing required environment variable '\(name)': \(operand)\n")
+            }
+            return envVars[name]!
+        default:
             break
         }
     }
-    return resolvedValue
+    if let value = envVars[expr] {
+        return value
+    }
+    // Unknown variable without default: leave the expression as written.
+    return "${\(expr)}"
+}
+
+/// Finds the first top-level occurrence of any operator string in `expr`
+/// (top-level = not inside a nested `${...}`), returning the index of its
+/// first character. Length-2 operators (`:-`, `:?`) are preferred over `-`/`?`.
+private func topLevelOperator(_ expr: String, operators: [String]) -> String.Index? {
+    var depth = 0
+    var i = expr.startIndex
+    while i < expr.endIndex {
+        if expr[i] == "$", expr.index(after: i) < expr.endIndex, expr[expr.index(after: i)] == "{" {
+            depth += 1
+            i = expr.index(after: i)
+        } else if expr[i] == "}" {
+            depth = max(0, depth - 1)
+        } else if depth == 0 {
+            for op in operators {
+                let end = expr.index(i, offsetBy: op.count, limitedBy: expr.endIndex) ?? expr.endIndex
+                if String(expr[i..<end]) == op {
+                    return i
+                }
+            }
+        }
+        i = expr.index(after: i)
+    }
+    return nil
 }
 
 /// Derives a project name from the current working directory. It replaces any '.' characters with
@@ -190,13 +269,20 @@ public func composePortToRunArg(_ portSpec: String) -> String {
 
 /// Converts a Docker Compose `volumes:` entry into the `--volume` arguments for `container run`.
 /// Internal so tests can reach it via `@testable import ContainerComposeCore`.
+///
+/// Named volumes listed in `sharedVolumes` are backed by a host directory
+/// (bind mount) instead of an apple/container block volume. apple/container
+/// attaches block volumes to a single VM at a time, so services that must
+/// share a volume concurrently (init/sidecar patterns) can only do so through
+/// a virtiofs-backed host directory. See `computeSharedVolumes`.
 func composeVolumeToRunArgs(
     _ volume: String,
     cwd: String,
     fileManager: FileManager = .default,
     environmentVariables: [String: String] = [:],
     projectName: String?,
-    volumeDefinitions: [String: Volume?]? = nil
+    volumeDefinitions: [String: Volume?]? = nil,
+    sharedVolumes: Set<String> = []
 ) throws -> [String] {
     let resolvedVolume = resolveVariable(volume, with: environmentVariables)
     var args: [String] = []
@@ -216,6 +302,18 @@ func composeVolumeToRunArgs(
         return "\(source):\(destination)"
     }
 
+    func fallbackToNamedVolume() -> [String] {
+        let volumeDefinition = volumeDefinitions?[source] ?? nil
+        let actualVolumeName = composeNamedVolumeName(
+            source: source,
+            projectName: projectName,
+            volumeDefinition: volumeDefinition
+        )
+        args.append("-v")
+        args.append(bindMountArg(source: actualVolumeName))
+        return args
+    }
+
     if source.contains("/") || source.starts(with: ".") || source.starts(with: "..") {
         let fullHostPath = resolvedPath(for: source, relativeTo: URL(fileURLWithPath: cwd, isDirectory: true))
 
@@ -233,18 +331,77 @@ func composeVolumeToRunArgs(
             }
         }
     } else {
-        let volumeDefinition = volumeDefinitions?[source] ?? nil
-        let actualVolumeName = composeNamedVolumeName(
-            source: source,
-            projectName: projectName,
-            volumeDefinition: volumeDefinition
-        )
-
-        args.append("-v")
-        args.append(bindMountArg(source: actualVolumeName))
+        if sharedVolumes.contains(source) {
+            let hostPath = sharedVolumeHostPath(projectName: projectName, volumeName: source)
+            do {
+                try fileManager.createDirectory(atPath: hostPath, withIntermediateDirectories: true)
+            } catch {
+                print("Warning: Could not create shared volume directory '\(hostPath)': \(error.localizedDescription). Falling back to a block volume.")
+                return fallbackToNamedVolume()
+            }
+            print(
+                "Info: Volume '\(source)' is shared by multiple services — backing it with host directory '\(hostPath)'.\n"
+                + "      Note: Unix domain sockets do not work across virtiofs; services in this volume must communicate over TCP."
+            )
+            return ["-v", bindMountArg(source: hostPath)]
+        }
+        return fallbackToNamedVolume()
     }
-
     return args
+}
+
+/// Host directory backing a shared named volume. Kept under the container
+/// application-support root so it lives alongside apple/container's own state
+/// and is excluded from Time Machine by the same conventions.
+public func sharedVolumeHostPath(projectName: String?, volumeName: String, fileManager: FileManager = .default) -> String {
+    let appSupport = fileManager.urls(for: .applicationSupportDirectory, in: .userDomainMask).first
+        ?? URL(fileURLWithPath: NSHomeDirectory()).appendingPathComponent("Library/Application Support")
+    let ns = "com.apple.container"
+    let prefix = projectName.map { "\($0)_" } ?? ""
+    return appSupport.appending(path: ns).appending(path: "shared-volumes").appending(path: "\(prefix)\(volumeName)").path
+}
+
+/// Determines which named volumes are shared by multiple services and must be
+/// backed by a host directory (see `composeVolumeToRunArgs`).
+///
+/// Selection honours `CONTAINER_COMPOSE_SHARED_VOLUMES`:
+///   - `never`  → no shared volumes (apple/container block volumes everywhere)
+///   - `always` → every named volume is host-backed
+///   - `auto` (default) → volumes referenced by two or more services
+///
+/// Returns volume names as written in the compose file (not project-prefixed).
+public func computeSharedVolumes(
+    serviceVolumes: [(serviceName: String, volumes: [String])],
+    environmentVariables: [String: String] = [:],
+    mode envMode: String? = ProcessInfo.processInfo.environment["CONTAINER_COMPOSE_SHARED_VOLUMES"]
+) -> Set<String> {
+    let mode = (envMode ?? "auto").lowercased()
+    switch mode {
+    case "never", "off", "false":
+        return []
+    case "always", "all", "true":
+        return Set(serviceVolumes.flatMap { _, volumes in namedVolumeSources(volumes, environmentVariables: environmentVariables) })
+    default:
+        var refcounts: [String: Int] = [:]
+        for (_, volumes) in serviceVolumes {
+            for name in namedVolumeSources(volumes, environmentVariables: environmentVariables) {
+                refcounts[name, default: 0] += 1
+            }
+        }
+        return Set(refcounts.filter { $0.value >= 2 }.keys)
+    }
+}
+
+/// Named-volume sources (no `/`, not relative) from raw `volumes:` entries,
+/// after environment-variable resolution. Entries like `name:/path[:mode]`.
+private func namedVolumeSources(_ volumes: [String], environmentVariables: [String: String]) -> [String] {
+    volumes.compactMap { entry in
+        let resolved = resolveVariable(entry, with: environmentVariables)
+        guard let source = resolved.split(separator: ":", maxSplits: 2).first else { return nil }
+        let name = String(source)
+        if name.isEmpty || name.contains("/") || name.hasPrefix(".") { return nil }
+        return name
+    }
 }
 
 func composeNamedVolumeName(

@@ -42,7 +42,7 @@ public struct Build: Codable, Hashable {
             let keyedContainer = try decoder.container(keyedBy: CodingKeys.self)
             self.context = try keyedContainer.decode(String.self, forKey: .context)
             self.dockerfile = try keyedContainer.decodeIfPresent(String.self, forKey: .dockerfile)
-            self.args = try keyedContainer.decodeIfPresent([String: String].self, forKey: .args)
+            self.args = try keyedContainer.decodeIfPresent([String: String].self, forKey: .args, orListWithSeparator: "=")
         }
     }
 

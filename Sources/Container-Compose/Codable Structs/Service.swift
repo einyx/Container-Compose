@@ -296,7 +296,7 @@ public struct Service: Codable, Hashable {
         user = try container.decodeIfPresent(String.self, forKey: .user)
 
         container_name = try container.decodeIfPresent(String.self, forKey: .container_name)
-        labels = try container.decodeIfPresent([String: String].self, forKey: .labels)
+        labels = try container.decodeIfPresent([String: String].self, forKey: .labels, orListWithSeparator: "=")
         if let networkArray = try? container.decodeIfPresent([String].self, forKey: .networks) {
             networks = networkArray
             networkConfigurations = Dictionary(uniqueKeysWithValues: networkArray.map { ($0, ServiceNetwork()) })

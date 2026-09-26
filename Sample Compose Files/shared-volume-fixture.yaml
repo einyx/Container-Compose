@@ -1,0 +1,17 @@
+# Fixture for shared (host-backed) named volume verification: a writer and a
+# reader service share one named volume. apple/container block volumes attach
+# to a single VM at a time, so this only runs with host-backed shared volumes.
+services:
+  writer:
+    image: alpine:latest
+    volumes:
+      - shared-config:/conf
+    command: ["sh", "-c", "echo hello-from-writer > /conf/greeting.txt && mkdir -p /conf/nested && echo nested > /conf/nested/inner.txt"]
+  reader:
+    image: alpine:latest
+    volumes:
+      - shared-config:/conf:ro
+    command: ["sh", "-c", "sleep 2 && cat /conf/greeting.txt && cat /conf/nested/inner.txt"]
+
+volumes:
+  shared-config: {}

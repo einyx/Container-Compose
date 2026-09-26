@@ -85,3 +85,35 @@ If you encounter issues or have questions, please open an [Issue](https://github
 ---
 
 Happy Coding! 🚀
+
+## Shared (host-backed) named volumes
+
+apple/container attaches a named volume (a sparse disk image) to a single VM at
+a time, so two containers cannot mount the same block volume concurrently —
+init/sidecar patterns fail with `The storage device attachment is invalid`.
+
+`container-compose` works around this by backing volumes referenced by **two or
+more services** with a host directory (virtiofs bind mount) instead of a block
+volume. Data lives under
+`~/Library/Application Support/com.apple.container/shared-volumes/<project>_<name>/`.
+
+Control the behavior with `CONTAINER_COMPOSE_SHARED_VOLUMES`:
+
+| Value    | Behavior                                              |
+|----------|-------------------------------------------------------|
+| `auto`   | (default) share volumes referenced by 2+ services      |
+| `always` | host-back every named volume                           |
+| `never`  | classic block volumes (single-VM attachment applies)   |
+
+### Limitations
+
+- **Unix domain sockets do not cross virtiofs** (`connect()` fails with
+  `Errno 95`). Volumes used to share sockets between containers (e.g. a
+  `/var/run/postgresql` socket sidecar) cannot work on apple/container in any
+  mode — use TCP instead.
+- The guest cannot `chown`/`chmod` files on shared volumes (ownership is
+  mapped from the host user). Images whose entrypoints insist on changing
+  permissions inside such a mount will fail; keep shared volumes pointed at
+  paths the image does not mutate permissions on.
+- I/O performance matches virtiofs, not a native block device — avoid for
+  write-heavy data directories.
