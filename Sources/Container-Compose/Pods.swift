@@ -101,25 +101,17 @@ public enum PodSupport {
     public static func resolvePods(
         _ services: [(serviceName: String, service: Service)]
     ) throws -> (standalone: [(serviceName: String, service: Service)], pods: [PodGroup]) {
-        let byName = Dictionary(uniqueKeysWithValues: services.map { ($0.serviceName, $0.service) })
-
+        // First pass: group pod members and validate each pod.
         var grouped: [String: [(serviceName: String, service: Service)]] = [:]
-        var standalone: [(serviceName: String, service: Service)] = []
         for entry in services {
-            guard let podName = entry.service.pod else {
-                standalone.append(entry)
-                continue
-            }
+            guard let podName = entry.service.pod else { continue }
             grouped[podName, default: []].append(entry)
         }
 
         var pods: [PodGroup] = []
+        var primaryNames = Set<String>()
         for (podName, members) in grouped {
-            // A single-member "pod" has nothing to coalesce; run it standalone.
-            guard members.count > 1 else {
-                standalone.append(contentsOf: members)
-                continue
-            }
+            guard members.count > 1 else { continue }
 
             let explicitPrimaries = members.filter { $0.service.podPrimary == true }
             let primary: (serviceName: String, service: Service)
@@ -160,14 +152,28 @@ public enum PodSupport {
 
             // The primary starts like any standalone service (with the union
             // of pod volumes); init members are executed inside it afterwards.
-            standalone.append(primary)
+            primaryNames.insert(primary.serviceName)
             pods.append(PodGroup(
                 name: podName,
                 primary: PodMember(serviceName: primary.serviceName, service: primary.service),
                 initMembers: initMembers))
         }
 
-        // Keep standalone ordering stable; pods are returned in first-seen order.
+        // Second pass: rebuild standalone in the ORIGINAL topological order —
+        // non-members as-is, pod primaries in place (init members are skipped;
+        // they execute inside the primary once it is healthy). Appending
+        // primaries after the fact would break dependency ordering for
+        // services that gate on the primary.
+        var standalone: [(serviceName: String, service: Service)] = []
+        for entry in services {
+            if let podName = entry.service.pod, grouped[podName].map({ $0.count > 1 }) == true {
+                if primaryNames.contains(entry.serviceName) {
+                    standalone.append(entry)
+                }
+                continue
+            }
+            standalone.append(entry)
+        }
         return (standalone, pods)
     }
 

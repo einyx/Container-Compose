@@ -108,16 +108,26 @@ public func resolveVariable(_ value: String, with envVars: [String: String]) -> 
 
     // Scan for `${...}` expressions, handling nested `${}` inside default values
     // (e.g. `${A:-${B:-fallback}}`), which regex-based matching cannot parse.
+    // `$$` escapes a literal `$` per the Compose spec (so `$$VAR` reaches the
+    // container as `$VAR` instead of being interpolated or shell-expanded).
     var result = ""
     var i = value.startIndex
     while i < value.endIndex {
-        if value[i] == "$", let (inner, afterExpr) = matchBracedExpression(value, at: i) {
-            result += resolveExpression(inner, envVars: combinedEnv)
-            i = afterExpr
-        } else {
-            result.append(value[i])
-            i = value.index(after: i)
+        if value[i] == "$" {
+            let next = value.index(after: i)
+            if next < value.endIndex, value[next] == "$" {
+                result.append("$")
+                i = value.index(after: next)
+                continue
+            }
+            if let (inner, afterExpr) = matchBracedExpression(value, at: i) {
+                result += resolveExpression(inner, envVars: combinedEnv)
+                i = afterExpr
+                continue
+            }
         }
+        result.append(value[i])
+        i = value.index(after: i)
     }
     return result
 }

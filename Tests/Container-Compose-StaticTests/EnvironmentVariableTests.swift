@@ -160,3 +160,13 @@ extension EnvironmentVariableTests {
         #expect(resolveVariable("-c shared_buffers=${X:-1GB}", with: ["X": "2GB"]) == "-c shared_buffers=2GB")
     }
 }
+
+extension EnvironmentVariableTests {
+    @Test("$$ escapes a literal dollar (Compose spec)")
+    func doubleDollarEscape() {
+        #expect(resolveVariable("$$MX_POSTGRES_PASSWORD", with: [:]) == "$MX_POSTGRES_PASSWORD")
+        #expect(resolveVariable("printf \"$1\"", with: [:]) == "printf \"$1\"")
+        #expect(resolveVariable("$${LITERAL}", with: ["LITERAL": "x"]) == "${LITERAL}")
+        #expect(resolveVariable("a=$$ b=${V:-d}", with: [:]) == "a=$ b=d")
+    }
+}

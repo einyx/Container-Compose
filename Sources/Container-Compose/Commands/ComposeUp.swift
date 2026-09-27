@@ -135,6 +135,9 @@ public struct ComposeUp: AsyncParsableCommand, @unchecked Sendable {
     /// Resolved pods keyed by primary service name. Init members of these pods
     /// are executed inside the primary's VM (see `runPodInitMembers`).
     private var podGroupsByPrimary: [String: PodGroup] = [:]
+    /// Docker-DNS network aliases per service, replicated into peers'
+    /// /etc/hosts by the cross-patcher (aliases are unsupported natively).
+    private var serviceAliases: [String: [String]] = [:]
     /// Resolved container ID (i.e. the name on disk) per service.
     /// Equal to `service.container_name` when set, otherwise either
     /// `<serviceName>.<dnsDomain>` (DNS path) or `<projectName>-<serviceName>` (legacy).
@@ -729,14 +732,21 @@ public struct ComposeUp: AsyncParsableCommand, @unchecked Sendable {
 
     // MARK: Compose Top Level Functions
 
-    private mutating func updateEnvironmentWithServiceIP(_ serviceName: String) async throws {
+    private mutating func updateEnvironmentWithServiceIP(
+        _ serviceName: String, service: Service? = nil
+    ) async throws {
         let ip = try await getIPForRunningService(serviceName)
         self.containerIps[serviceName] = ip
+        if let service {
+            self.serviceAliases[serviceName] = (service.networkConfigurations ?? [:]).values
+                .flatMap { $0.aliases ?? [] }
+                .map { resolveVariable($0, with: environmentVariables) }
+        }
         for (key, value) in environmentVariables.map({ ($0, $1) }) where value == serviceName {
             self.environmentVariables[key] = ip ?? value
         }
         if !dnsAvailable {
-            await crossPatchHostsForService(serviceName)
+            await crossPatchHostsForService(serviceName, service: service)
         }
     }
 
@@ -745,15 +755,27 @@ public struct ComposeUp: AsyncParsableCommand, @unchecked Sendable {
     /// already-running peer to add `<thisIP> <thisService>`, and also add all the
     /// previously-known peers into the new container. This is best-effort — services
     /// that need DNS at startup time should still wait/retry.
-    private func crossPatchHostsForService(_ newServiceName: String) async {
+    private func crossPatchHostsForService(_ newServiceName: String, service: Service? = nil) async {
         guard let newIP = containerIps[newServiceName] else { return }
         let newContainerID = containerName(for: newServiceName)
-        // Add the new entry in every previously-running peer.
+        // Docker-DNS network aliases resolve to the same IP as the service;
+        // replicate that by adding them next to the service name everywhere.
+        let newAliases = (service?.networkConfigurations ?? [:]).values
+            .flatMap { $0.aliases ?? [] }
+            .map { resolveVariable($0, with: environmentVariables) }
+        // Add the new entry (plus aliases) in every previously-running peer.
         for (peerName, peerIP) in containerIps where peerName != newServiceName {
             let peerContainerID = containerName(for: peerName)
             await appendHostsEntry(in: peerContainerID, name: newServiceName, ip: newIP)
-            // Also make the new container aware of this peer, in case it queries it later.
+            for alias in newAliases {
+                await appendHostsEntry(in: peerContainerID, name: alias, ip: newIP)
+            }
+            // Also make the new container aware of this peer (and its aliases),
+            // in case it queries them later.
             await appendHostsEntry(in: newContainerID, name: peerName, ip: peerIP)
+            for alias in serviceAliases[peerName] ?? [] {
+                await appendHostsEntry(in: newContainerID, name: alias, ip: peerIP)
+            }
         }
     }
 
@@ -917,10 +939,11 @@ public struct ComposeUp: AsyncParsableCommand, @unchecked Sendable {
         if let buildConfig = service.build {
             imageToRun = try await buildService(buildConfig, for: service, serviceName: serviceName)
         } else if let img = service.image {
-            // Use specified image if no build config
+            // Use specified image if no build config (interpolating ${VAR}
+            // expressions, e.g. `image: ${PGPOOL_IMAGE:-ghcr.io/x/pgpool:4.4}`).
             // Pull image if necessary
-            try await pullImage(img, platform: service.platform)
-            imageToRun = img
+            imageToRun = resolveVariable(img, with: environmentVariables)
+            try await pullImage(imageToRun, platform: service.platform)
         } else {
             // Should not happen due to Service init validation, but as a fallback
             throw ComposeError.imageNotFound(serviceName)
@@ -1331,7 +1354,7 @@ public struct ComposeUp: AsyncParsableCommand, @unchecked Sendable {
 
         switch startState {
         case .running:
-            try await updateEnvironmentWithServiceIP(serviceName)
+            try await updateEnvironmentWithServiceIP(serviceName, service: service)
             if let healthcheck = service.healthcheck, !healthcheck.isDisabled {
                 try await waitUntilServiceIsHealthy(serviceName: serviceName, healthcheck: healthcheck)
                 serviceHealth[serviceName] = true

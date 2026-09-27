@@ -181,3 +181,21 @@ struct PodsTests {
         #expect(standalone.map(\.serviceName) == ["db"])
     }
 }
+
+extension PodsTests {
+    @Test("Pod primary keeps its topological position in standalone order")
+    func primaryKeepsTopologicalPosition() throws {
+        let (standalone, pods) = try PodSupport.resolvePods([
+            svc("gate", service(image: "pg:15", restart: "unless-stopped")),
+            svc("one-shot", service(image: "pg:15", restart: "no", pod: "p", command: ["sh", "-c", "echo"])),
+            svc("db", service(image: "pg:15", restart: "unless-stopped", pod: "p")),
+            svc("dependent", service(image: "pg:15", restart: "unless-stopped")),
+        ])
+        // "db" (the primary) must stay at index 1 — after "gate", before
+        // "dependent" — not appended to the end, or services gating on it
+        // would evaluate before it exists.
+        #expect(standalone.map(\.serviceName) == ["gate", "db", "dependent"])
+        #expect(pods.count == 1)
+        #expect(pods[0].initMembers.map(\.serviceName) == ["one-shot"])
+    }
+}
