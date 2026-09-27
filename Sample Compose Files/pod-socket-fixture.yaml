@@ -1,0 +1,52 @@
+# Fixture for pod (x-pod) verification: a socket server (primary) and an init
+# member that connects to it over a Unix domain socket carried by a named
+# volume. This is impossible with separate apple/container VMs — block volumes
+# attach to one VM at a time, and virtiofs cannot carry AF_UNIX — so this only
+# runs when both services coalesce into a single pod VM.
+services:
+  sockserver:
+    image: python:3.12-alpine
+    restart: unless-stopped
+    x-pod: sock-plane
+    x-pod-primary: true
+    volumes:
+      - sock-vol:/socks
+    command:
+      - python3
+      - -c
+      - |
+        import socket, os
+        p = "/socks/test.sock"
+        if os.path.exists(p): os.unlink(p)
+        s = socket.socket(socket.AF_UNIX)
+        s.bind(p); s.listen(1)
+        print("server: listening", flush=True)
+        while True:
+            c, _ = s.accept()
+            c.sendall(b"hello-from-primary")
+            c.close()
+
+  sockclient:
+    image: python:3.12-alpine
+    restart: "no"
+    x-pod: sock-plane
+    volumes:
+      - sock-vol:/socks
+    command:
+      - python3
+      - -c
+      - |
+        import socket, time, sys
+        s = socket.socket(socket.AF_UNIX)
+        for _ in range(20):
+            try:
+                s.connect("/socks/test.sock")
+                break
+            except (FileNotFoundError, ConnectionRefusedError):
+                time.sleep(0.5)
+        else:
+            sys.exit("client: could not connect")
+        print("client got:", s.recv(64).decode(), flush=True)
+
+volumes:
+  sock-vol: {}

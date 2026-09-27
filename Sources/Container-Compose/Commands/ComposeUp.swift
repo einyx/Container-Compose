@@ -132,6 +132,9 @@ public struct ComposeUp: AsyncParsableCommand, @unchecked Sendable {
     /// can mount them concurrently. apple/container block volumes attach to a
     /// single VM at a time; see `computeSharedVolumes`.
     private var sharedVolumes: Set<String> = []
+    /// Resolved pods keyed by primary service name. Init members of these pods
+    /// are executed inside the primary's VM (see `runPodInitMembers`).
+    private var podGroupsByPrimary: [String: PodGroup] = [:]
     /// Resolved container ID (i.e. the name on disk) per service.
     /// Equal to `service.container_name` when set, otherwise either
     /// `<serviceName>.<dnsDomain>` (DNS path) or `<projectName>-<serviceName>` (legacy).
@@ -212,10 +215,23 @@ public struct ComposeUp: AsyncParsableCommand, @unchecked Sendable {
 
         // Process top-level volumes
         // This creates named volumes defined in the docker-compose.yml
+        // Resolve pods (`x-pod`): members coalesce into the primary's VM and
+        // are executed there, so they must not be started standalone. Shared
+        // volumes are computed over the post-pod service set: volumes unioned
+        // into a pod attach to a single VM anyway, so they never need
+        // host-backing even when several pod members reference them.
+        let (standaloneTargets, podGroups) = try PodSupport.resolvePods(
+            project.services.map { ($0.serviceName, $0.service) })
+        for pod in podGroups {
+            print("Pod '\(pod.name)': primary '\(pod.primary.serviceName)', init members: \(pod.initMembers.map(\.serviceName))")
+        }
+        podGroupsByPrimary = Dictionary(
+            uniqueKeysWithValues: podGroups.map { ($0.primary.serviceName, $0) })
+
         if let volumes = dockerCompose.volumes {
             print("\n--- Processing Volumes ---")
             sharedVolumes = computeSharedVolumes(
-                serviceVolumes: project.services.map { ($0.serviceName, $0.service.volumes ?? []) },
+                serviceVolumes: standaloneTargets.map { ($0.serviceName, $0.service.volumes ?? []) },
                 environmentVariables: environmentVariables
             )
             if !sharedVolumes.isEmpty {
@@ -235,13 +251,13 @@ public struct ComposeUp: AsyncParsableCommand, @unchecked Sendable {
         // Process each service defined in the docker-compose.yml
         print("\n--- Processing Services ---")
 
-        print(project.services.map(\.serviceName))
-        for target in project.services {
+        print(standaloneTargets.map(\.serviceName))
+        for target in standaloneTargets {
             try await configService(target.service, serviceName: target.serviceName, from: dockerCompose)
         }
 
         if !detach {
-            let stopTargets = project.services.map {
+            let stopTargets = standaloneTargets.map {
                 ComposeContainerStopTarget(
                     containerName: containerName(for: $0.serviceName),
                     timeoutInSeconds: $0.service.stopTimeoutInSeconds
@@ -845,6 +861,51 @@ public struct ComposeUp: AsyncParsableCommand, @unchecked Sendable {
     }
 
     // MARK: Compose Service Level Functions
+
+    /// Runs a pod's init members inside the primary's VM via `container exec`,
+    /// in topological order. Each member's exit code is checked: non-zero
+    /// aborts `up` so `service_completed_successfully` semantics are honored.
+    /// On success the member is recorded as `.completed` so downstream
+    /// dependency gates pass.
+    private mutating func runPodInitMembers(_ pod: PodGroup) async throws {
+        guard !pod.initMembers.isEmpty else { return }
+        let primaryContainer = containerName(for: pod.primary.serviceName)
+        for member in pod.initMembers {
+            print("\nRunning pod '\(pod.name)' init member: \(member.serviceName)")
+            print("----------------------------------------")
+
+            var execArgs = ["exec"]
+            execArgs.append(contentsOf: PodSupport.execEnvironmentFlags(
+                for: member.service, environmentVariables: environmentVariables))
+            if let user = member.service.user {
+                execArgs.append(contentsOf: ["-u", user])
+            }
+            if let workdir = member.service.working_dir {
+                execArgs.append(contentsOf: ["-w", workdir])
+            }
+            execArgs.append(primaryContainer)
+            execArgs.append(contentsOf: try PodSupport.execArgv(for: member.service))
+
+            let memberName = member.serviceName
+            let selectedColor = containerConsoleColors[memberName]
+                ?? Self.availableContainerConsoleColors.randomElement()!
+            containerConsoleColors[memberName] = selectedColor
+
+            let exitCode = try await streamCommand(
+                "container",
+                args: execArgs,
+                onStdout: { print("\(memberName): \($0)".applyingColor(selectedColor)) },
+                onStderr: { print("\(memberName): \($0)".applyingColor(selectedColor)) }
+            )
+            guard exitCode == 0 else {
+                throw ComposeError.containerRunFailed(member.serviceName, exitCode)
+            }
+            serviceStartStates[member.serviceName] = .completed
+            serviceHealth[member.serviceName] = true
+            print("----------------------------------------\n")
+        }
+    }
+
     private mutating func configService(_ service: Service, serviceName: String, from dockerCompose: DockerCompose) async throws {
         try waitForDependencyConditions(serviceName: serviceName, service: service)
 
@@ -934,12 +995,18 @@ public struct ComposeUp: AsyncParsableCommand, @unchecked Sendable {
             runCommandArgs.append(user)
         }
 
-        // Add volume mounts
-        if let volumes = service.volumes {
-            for volume in volumes {
-                let args = try await configVolume(volume, from: dockerCompose)
-                runCommandArgs.append(contentsOf: args)
-            }
+        // Add volume mounts. For a pod primary, the union of all pod members'
+        // volumes is attached here — that is what lets members share block
+        // volumes and Unix sockets inside the single pod VM.
+        let effectiveVolumes: [String]
+        if let pod = podGroupsByPrimary[serviceName] {
+            effectiveVolumes = PodSupport.unionVolumes(primary: service, initMembers: pod.initMembers)
+        } else {
+            effectiveVolumes = service.volumes ?? []
+        }
+        for volume in effectiveVolumes {
+            let args = try await configVolume(volume, from: dockerCompose)
+            runCommandArgs.append(contentsOf: args)
         }
 
         // Combine environment variables from .env files and service environment
@@ -1040,6 +1107,25 @@ public struct ComposeUp: AsyncParsableCommand, @unchecked Sendable {
         // address whenever the machine's default route isn't the vmnet bridge (e.g.
         // any normal Wi-Fi/Ethernet setup) — so containers would gain an entry
         // pointing at the router, not the host.
+        if let pod = podGroupsByPrimary[serviceName], (service.extra_hosts ?? []).isEmpty {
+            // Pod primary: map the service name, its network aliases, and its
+            // member names to loopback. Everything runs in this one VM, so
+            // self-referential connections (e.g. an init member dialing the
+            // primary's alias) resolve locally without going through DNS.
+            var podHostnames = [serviceName] + pod.initMembers.map(\.serviceName)
+            for config in (service.networkConfigurations ?? [:]).values {
+                podHostnames += (config.aliases ?? []).map { resolveVariable($0, with: environmentVariables) }
+            }
+            let hostsFilePath = Self.extraHostsFilePath(projectName: projectName, serviceName: serviceName)
+            do {
+                let lines = ["127.0.0.1 localhost", "::1 localhost", "127.0.0.1 " + podHostnames.joined(separator: " ")]
+                try (lines.joined(separator: "\n") + "\n").write(toFile: hostsFilePath, atomically: true, encoding: .utf8)
+                runCommandArgs.append(contentsOf: ["-v", "\(hostsFilePath):/etc/hosts"])
+            } catch {
+                print("Warning: could not write pod hosts file for service '\(serviceName)' at \(hostsFilePath): \(error.localizedDescription)")
+            }
+        }
+
         if let extraHosts = service.extra_hosts, !extraHosts.isEmpty {
             print(
                 "Note: service '\(serviceName)' sets extra_hosts. Since 'container run' has no --add-host "
@@ -1249,6 +1335,11 @@ public struct ComposeUp: AsyncParsableCommand, @unchecked Sendable {
             if let healthcheck = service.healthcheck, !healthcheck.isDisabled {
                 try await waitUntilServiceIsHealthy(serviceName: serviceName, healthcheck: healthcheck)
                 serviceHealth[serviceName] = true
+            }
+            // The primary is up and healthy — run its pod's init members
+            // inside the same VM, in dependency order.
+            if let pod = podGroupsByPrimary[serviceName] {
+                try await runPodInitMembers(pod)
             }
         case .completed:
             if let healthcheck = service.healthcheck, !healthcheck.isDisabled {

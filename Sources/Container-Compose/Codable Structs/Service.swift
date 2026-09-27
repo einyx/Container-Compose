@@ -129,6 +129,18 @@ public struct Service: Codable, Hashable {
     /// eligible service, both of which bypass the profile gate per the Compose spec.
     public let profiles: [String]?
 
+    /// Pod membership. Services sharing a pod name coalesce into a single
+    /// container VM under container-compose (so they share the kernel: Unix
+    /// sockets, block volumes, loopback). Docker ignores `x-` keys, so on
+    /// Docker runtimes every member still runs as its own container and
+    /// behavior is unchanged. Members must share the primary's image.
+    public let pod: String?
+
+    /// Marks this service as the pod primary — the long-running service whose
+    /// image and VM host the other pod members. When unset, the first
+    /// non-init member (restart policy other than "no") is elected.
+    public let podPrimary: Bool?
+
     /// Other services that depend on this service
     public var dependedBy: [String] = []
 
@@ -136,7 +148,7 @@ public struct Service: Codable, Hashable {
     enum CodingKeys: String, CodingKey {
         case image, build, deploy, restart, stop_grace_period, healthcheck, volumes, environment, env_file, ports, command, depends_on, user,
              container_name, labels, networks, hostname, entrypoint, privileged, read_only, working_dir, configs, secrets, stdin_open, tty, platform,
-             mem_limit, extra_hosts, profiles
+             mem_limit, extra_hosts, profiles, pod = "x-pod", podPrimary = "x-pod-primary"
     }
     
     /// Public memberwise initializer for testing
@@ -172,6 +184,8 @@ public struct Service: Codable, Hashable {
         mem_limit: String? = nil,
         extra_hosts: [String]? = nil,
         profiles: [String]? = nil,
+        pod: String? = nil,
+        podPrimary: Bool? = nil,
         dependedBy: [String] = []
     ) {
         self.image = image
@@ -205,6 +219,8 @@ public struct Service: Codable, Hashable {
         self.mem_limit = mem_limit
         self.extra_hosts = extra_hosts
         self.profiles = profiles
+        self.pod = pod
+        self.podPrimary = podPrimary
         self.dependedBy = dependedBy
     }
 
@@ -351,6 +367,8 @@ public struct Service: Codable, Hashable {
         // `profiles` is a plain list of strings per the Compose spec (no shorthand
         // single-string form).
         profiles = try container.decodeIfPresent([String].self, forKey: .profiles)
+        pod = try container.decodeIfPresent(String.self, forKey: .pod)
+        podPrimary = try container.decodeIfPresent(Bool.self, forKey: .podPrimary)
     }
 
     /// True when this service should be included by default given the currently
